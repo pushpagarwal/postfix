@@ -20,8 +20,8 @@ $(OBJS): ../../conf/makedefs.out
 Makefile: Makefile.in
 	cat ../../conf/makedefs.out $? >$@
 
-smtp-sink: smtp-sink.o $(LIBS)
-	$(CC) $(CFLAGS) $(SHLIB_RPATH) -o $@ smtp-sink.o $(LIBS) $(SYSLIBS)
+smtp-sink: smtp-sink.o cp-handler.o $(LIBS)
+	$(CC) $(CFLAGS) $(SHLIB_RPATH) -o $@ smtp-sink.o cp-handler.o $(LIBS) $(SYSLIBS)
 
 smtp-source: smtp-source.o $(LIBS)
 	$(CC) $(CFLAGS) $(SHLIB_RPATH) -o $@ smtp-source.o $(LIBS) $(SYSLIBS)

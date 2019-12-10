@@ -307,6 +307,8 @@
 #include <mail_date.h>
 #include <mail_version.h>
 
+#include "cp-handler.h"
+
 /* Application-specific. */
 
 typedef struct SINK_STATE {
@@ -371,7 +373,7 @@ static int sess_count;
 static int quit_count;
 static int mesg_count;
 static int max_quit_count;
-static int max_msg_quit_count;
+static int max_msg_quit_count = 0;
 static int disable_pipelining;
 static int disable_8bitmime;
 static int disable_esmtp;
@@ -387,6 +389,7 @@ static int client_count;
 static int sock;
 static int abort_delay = -1;
 static int data_read_delay = 0;
+static int enable_multiprocess = 0;
 
 static char *single_template;		/* individual template */
 static char *shared_template;		/* shared template */
@@ -1331,23 +1334,18 @@ static void disconnect(SINK_STATE *state)
     myfree((void *) state);
     if (max_quit_count > 0 && quit_count >= max_quit_count)
 	exit(0);
-    if (client_count-- == max_client_count)
+    if (!enable_multiprocess && client_count-- == max_client_count)
 	event_enable_read(sock, connect_event, (void *) 0);
 }
 
 /* connect_event - handle connection events */
 
-static void connect_event(int unused_event, void *unused_context)
+static void on_connect_event(int fd, struct sockaddr *sa,int len)
 {
-    struct sockaddr_storage ss;
-    SOCKADDR_SIZE len = sizeof(ss);
-    struct sockaddr *sa = (struct sockaddr *) &ss;
     SINK_STATE *state;
-    int     fd;
 
-    if ((fd = sane_accept(sock, sa, &len)) >= 0) {
 	/* Safety: limit the number of open sockets and capture files. */
-	if (++client_count == max_client_count)
+	if (!enable_multiprocess && ++client_count == max_client_count)
 	    event_disable_readwrite(sock);
 	state = (SINK_STATE *) mymalloc(sizeof(*state));
 	if (strchr((char *) proto_info->sa_family_list, sa->sa_family))
@@ -1393,7 +1391,6 @@ static void connect_event(int unused_event, void *unused_context)
 	state->start_time = 0;
 	state->id = 0;
 	state->dump_file = 0;
-
 	/*
 	 * We use the smtp_stream module to produce output. That module
 	 * throws an exception via vstream_longjmp() in case of a timeout or
@@ -1424,14 +1421,28 @@ static void connect_event(int unused_event, void *unused_context)
 		event_request_timer(read_timeout, (void *) state, var_tmout);
 	    }
 	}
-    }
+}
+
+static void connect_event(int unused_event, void *unused_context)
+{
+   struct sockaddr_storage ss;
+    SOCKADDR_SIZE len = sizeof(ss);
+    struct sockaddr *sa = (struct sockaddr *) &ss;
+ 
+	int fd;
+	if ((fd = sane_accept(sock, sa, &len)) >= 0) {
+		if(enable_multiprocess)
+			ask_child_to_connect(fd,sa,len);
+		else
+			on_connect_event(fd,sa,len);
+	}
 }
 
 /* usage - explain */
 
 static void usage(char *myname)
 {
-    msg_fatal("usage: %s [-468acCeEFLpPv] [-A abort_delay] [-b soft_bounce_reply] [-B hard_bounce_reply] [-d dump-template] [-D dump-template] [-f commands] [-h hostname] [-m max_concurrency] [-M message_quit_count] [-n quit_count] [-q commands] [-r commands] [-R root-dir] [-s commands] [-S start-string] [-u user_privs] [-w delay] [host]:port backlog", myname);
+    msg_fatal("usage: %s [-468acCeEFLpPv] [-A abort_delay] [-b soft_bounce_reply] [-B hard_bounce_reply] [-d dump-template] [-D dump-template] [-f commands] [-h hostname] [-m max_concurrency] [-M message_quit_count] [-n quit_count] [-q commands] [-r commands] [-R root-dir] [-s commands] [-S start-string] [-u user_privs] [-w delay] [-y max_child_processes] [host]:port backlog", myname);
 }
 
 MAIL_VERSION_STAMP_DECLARE;
@@ -1441,6 +1452,7 @@ int     main(int argc, char **argv)
     int     backlog;
     int     ch;
     int     delay;
+    int num_child_process = 8;
     const char *protocols = INET_PROTO_NAME_ALL;
     const char *root_dir = 0;
     const char *user_privs = 0;
@@ -1463,7 +1475,7 @@ int     main(int argc, char **argv)
     /*
      * Parse JCL.
      */
-    while ((ch = GETOPT(argc, argv, "468aA:b:B:cCd:D:eEf:Fh:H:Ln:m:M:NpPq:Q:r:R:s:S:t:T:u:vw:W:")) > 0) {
+    while ((ch = GETOPT(argc, argv, "468aA:b:B:cCd:D:eEf:Fh:H:Ln:m:M:NpPq:Q:r:R:s:S:t:T:u:vw:W:y:")) > 0) {
 	switch (ch) {
 	case '4':
 	    protocols = INET_PROTO_NAME_IPV4;
@@ -1597,6 +1609,10 @@ int     main(int argc, char **argv)
 	case 'W':
 	    set_cmd_delay_arg(optarg);
 	    break;
+	case 'y':
+	    enable_multiprocess = 1;
+	    num_child_process = atoi(optarg);
+	    break;
 	default:
 	    usage(argv[0]);
 	}
@@ -1618,14 +1634,7 @@ int     main(int argc, char **argv)
     set_cmds_flags(enable_lmtp ? "lhlo" :
 		   disable_esmtp ? "helo" :
 		   "helo, ehlo", FLAG_ENABLE);
-    proto_info = inet_proto_init("protocols", protocols);
-    if (strncmp(argv[optind], "unix:", 5) == 0) {
-	sock = unix_listen(argv[optind] + 5, backlog, BLOCKING);
-    } else {
-	if (strncmp(argv[optind], "inet:", 5) == 0)
-	    argv[optind] += 5;
-	sock = inet_listen(argv[optind], backlog, BLOCKING);
-    }
+    proto_info = inet_proto_init("protocols", protocols); 
     if (user_privs)
 	chroot_uid(root_dir, user_privs);
 
@@ -1634,6 +1643,17 @@ int     main(int argc, char **argv)
     else if (shared_template)
 	single_template = shared_template;
 
+	if(enable_multiprocess)
+		init_child_processes(num_child_process,on_connect_event);
+ 
+    if (strncmp(argv[optind], "unix:", 5) == 0) {
+	sock = unix_listen(argv[optind] + 5, backlog, BLOCKING);
+    } else {
+	if (strncmp(argv[optind], "inet:", 5) == 0)
+	    argv[optind] += 5;
+	sock = inet_listen(argv[optind], backlog, BLOCKING);
+    }
+    
     /*
      * Start the event handler.
      */
